@@ -1,169 +1,81 @@
-# Security Model
+# AAPM Security Specification
 
-## Threat Model
+**Version**: 1.0
+**Date**: 2026-01-06
 
-### Assumptions
+---
 
-1. **Trusted Infrastructure**: We assume the AAPM backend infrastructure (database, Kafka, worker) is trusted and not compromised.
-2. **API Key Security**: API keys are stored as SHA-256 hashes. If an API key is compromised, it can be rotated.
-3. **Network Security**: All communication should use TLS in production (not enforced in MVP).
+## 1. Security Overview
 
-### Threats
+This document outlines the security model of the **Agent Activity & Permission Monitor (AAPM)**. The primary security goals are:
+- **Confidentiality**: Protecting sensitive data within event logs.
+- **Integrity**: Ensuring event logs are tamper-evident (covered in `INTEGRITY_SPEC.md`).
+- **Availability**: Ensuring the system is resilient to denial-of-service attacks.
+- **Authentication & Authorization**: Ensuring only authorized entities can access the system.
 
-#### 1. Event Tampering
+## 2. Key Management and Rotation
 
-**Threat**: An attacker modifies stored events to hide malicious activity.
+Cryptographic keys are the foundation of AAPM's non-repudiation guarantees. Proper management is critical.
 
-**Mitigation**:
-- Cryptographic hash chaining: Any modification breaks the chain
-- Digital signatures on batch roots: Proves origin and prevents retroactive fabrication
-- Immutable append-only log structure
+### 2.1. Key Hierarchy
 
-**Detection**: Chain verification endpoint detects tampering immediately.
+AAPM uses a two-tier key model:
+1.  **Master Encryption Key**: An AES-256 key used to encrypt all private keys at rest. This key should be managed by a Key Management Service (KMS) like AWS KMS or HashiCorp Vault in production. For the demo, it is derived from an environment variable.
+2.  **Signing Keys**: Ed25519 key pairs used for signing batch root hashes. Each organization has its own set of signing keys.
 
-#### 2. API Key Theft
+### 2.2. Key Storage
 
-**Threat**: API key is stolen and used to inject false events.
+-   **Private Keys**: All Ed25519 private keys are encrypted using the Master Encryption Key (via Fernet symmetric encryption) before being stored in the `crypto_keys` table. They are only ever decrypted in memory just before a signing operation.
+-   **Public Keys**: Public keys are stored in plaintext in the `crypto_keys` table and are safe to expose.
 
-**Mitigation**:
-- API keys stored as hashes (cannot be recovered)
-- Rate limiting (future)
-- Key rotation capability
-- Audit logs of API key usage
+### 2.3. Key Rotation
 
-**Response**: Rotate API key immediately, invalidate old key.
+To mitigate the risk of a compromised private key, AAPM supports and encourages regular key rotation.
 
-#### 3. Data Exfiltration
+-   **Process**: The `POST /v1/keys/rotate` endpoint initiates key rotation.
+    1.  A new Ed25519 key pair is generated.
+    2.  The new key is marked as `active`.
+    3.  The previously active key is marked as `inactive` (`active = false`).
+-   **Verification**: Old (inactive) keys are **never deleted**. They are retained indefinitely to allow for the verification of signatures created in the past. The `key_id` stored with each signature ensures that the correct public key is used during verification.
 
-**Threat**: Sensitive data (user queries, PII) is stored or leaked.
+## 3. Data Privacy and Storage Isolation
 
-**Mitigation**:
-- **Data Minimization**: User queries are hashed, not stored in plaintext
-- Only metadata and hashes are stored
-- Data sources identified by identifier, not content
-- No raw payload storage
+### 3.1. Multi-Tenancy and Data Isolation
 
-**Best Practice**: Customers should hash sensitive data before sending to AAPM.
+AAPM is a multi-tenant system. All data is strictly partitioned by `org_id` at both the API and database levels. API endpoints require an API key that is mapped to a single `org_id`, and all database queries are scoped to that `org_id`.
 
-#### 4. Denial of Service
+This prevents one organization from ever accessing another organization's data.
 
-**Threat**: Attacker floods API with events.
+### 3.2. Hash Privacy Model (Excluding Sensitive Data)
 
-**Mitigation**:
-- Rate limiting per API key (future)
-- Kafka buffering prevents backend overload
-- Async processing prevents blocking
+To protect sensitive information that may appear in agent activities (e.g., user queries, file contents), the `event_hash` is computed on a "safe" version of the event payload. Sensitive fields are either omitted or replaced with a hash.
 
-#### 5. Signature Key Compromise
+| Field | Handling in Hash | Rationale |
+|---|---|---|
+| `user_query` | Replaced with `user_query_hash` | Protects user privacy. The query itself is not needed for an audit trail of actions. |
+| `file_contents` | Omitted | Avoids storing potentially large and sensitive data in the event log. |
+| `api_secrets` | Omitted | Prevents secrets from ever being logged. |
 
-**Threat**: Signing private key is stolen.
+This model ensures that the cryptographic proof can be shared for verification without exposing confidential information.
 
-**Mitigation**:
-- Key rotation support (key_id in signatures)
-- Keys stored in environment variables (MVP)
-- Future: Use KMS (AWS KMS, HashiCorp Vault)
+## 4. Authentication and Authorization
 
-**Response**: Rotate key, re-sign recent batches if needed.
+### 4.1. API Key Authentication
 
-## Data Minimization
+All access to the AAPM API is authenticated via a secret API key, passed in the `X-API-Key` HTTP header. Each key is unique to an organization.
 
-### What We Store
+-   **Storage**: API keys are hashed with **SHA-256** before being stored in the `api_keys` table. This prevents direct secret exposure in case of a database breach.
+-   **Validation**: On each request, the provided key is hashed and compared to the stored hash.
 
-- **Agent metadata**: Name, framework, assistant_id
-- **Event metadata**: Event type, timestamps, tool names
-- **Data source identifiers**: e.g., "file_xyz", "db:customers" (not content)
-- **Hashes**: User query hashes, event hashes, chain hashes
-- **Token counts**: User query token count (not content)
+### 4.2. Authorization
 
-### What We DON'T Store
+Authorization is based on the `org_id` associated with the validated API key. All operations are strictly scoped to the data owned by that organization.
 
-- **User queries**: Only hashes are stored
-- **Data content**: Only identifiers
-- **API responses**: Not captured
-- **Model outputs**: Not captured
-- **Raw payloads**: Only hashed versions
+## 5. Network Security
 
-### Privacy Considerations
+-   **TLS**: All communication with the AAPM API should be encrypted with TLS 1.2 or higher.
+-   **Firewalls**: In a production environment, the database and Kafka brokers should be placed in a private network, accessible only by the backend API and worker services.
 
-1. **User Query Hashing**: Customers should hash queries before sending if they contain PII.
-2. **Data Source Naming**: Use generic identifiers, not actual file paths with PII.
-3. **Retention**: 90-day default retention (configurable).
+---
 
-## Access Control (MVP)
-
-### Current Implementation
-
-- **API Key Authentication**: Simple API key in header
-- **Organization Isolation**: Events scoped by org_id
-- **No RBAC**: All users with API key have full access
-
-### Future Enhancements
-
-- SSO integration (SAML, OIDC)
-- Role-based access control (RBAC)
-- Fine-grained permissions
-- Audit logs of admin actions
-
-## Cryptographic Guarantees
-
-### Integrity
-
-- **Event Hashing**: SHA-256 hash of canonicalized event payload
-- **Hash Chaining**: Each event's chain_hash depends on previous event
-- **Tamper Detection**: Any modification breaks the chain (detectable)
-
-### Attribution
-
-- **Digital Signatures**: Ed25519 signatures on batch root hashes
-- **Key ID Tracking**: Signatures include key_id for rotation support
-- **Timestamping**: Signed_at timestamp for each signature
-
-### Auditability
-
-- **Independent Verification**: Anyone with public key can verify signatures
-- **Chain Verification**: Endpoint allows verification without AAPM system
-- **Export Capability**: Events can be exported with hashes and signatures
-
-## Key Management
-
-### MVP
-
-- Private key stored in environment variable `AAPM_SIGNING_KEY`
-- Key ID stored in `AAPM_KEY_ID`
-- No key rotation automation
-
-### Production Recommendations
-
-1. **Use KMS**: AWS KMS, Google Cloud KMS, or HashiCorp Vault
-2. **Key Rotation**: Rotate keys periodically (e.g., every 90 days)
-3. **Key Versioning**: Support multiple active keys during rotation
-4. **Backup**: Secure backup of signing keys (encrypted)
-
-## Compliance
-
-### SOC 2
-
-- Cryptographic audit trails provide evidence of integrity
-- Access logs (API key usage) for access control
-- Data minimization supports privacy requirements
-
-### GDPR
-
-- Data minimization: Only hashes and metadata stored
-- Right to deletion: Events can be deleted (breaks chain - documented)
-- Data portability: Export capability with verification
-
-### ISO 27001
-
-- Cryptographic controls for integrity
-- Access control (API keys)
-- Audit trails (event chain)
-
-## Recommendations
-
-1. **Use TLS**: Always use HTTPS in production
-2. **Rotate Keys**: Rotate API keys and signing keys periodically
-3. **Monitor**: Monitor for unusual activity (future)
-4. **Backup**: Regular backups of database (including chain data)
-5. **Key Storage**: Use KMS for signing keys in production
-
+This security model provides a defense-in-depth approach to protecting the confidentiality, integrity, and availability of agent audit trails.
